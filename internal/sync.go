@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"regexp"
 
 	"github.com/awslabs/ssosync/internal/aws"
 	"github.com/awslabs/ssosync/internal/config"
@@ -173,9 +174,16 @@ func (s *syncGSuite) SyncGroups(query string) error {
 		return err
 	}
 
+	// find embedded groups
+	allGoogleGroups, err := s.getEmbeddedGoogleGroups(googleGroups)
+	log.Debug(allGoogleGroups)
+	if err != nil {
+		return err
+	}
+
 	correlatedGroups := make(map[string]*aws.Group)
 
-	for _, g := range googleGroups {
+	for _, g := range allGoogleGroups {
 		if s.ignoreGroup(g.Email) || !s.includeGroup(g.Email) {
 			continue
 		}
@@ -277,8 +285,16 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 	if err != nil {
 		return err
 	}
+
+	// find embedded groups
+	allGoogleGroups, err := s.getEmbeddedGoogleGroups(googleGroups)
+	log.Debug(allGoogleGroups)
+	if err != nil {
+		return err
+	}
+
 	filteredGoogleGroups := []*admin.Group{}
-	for _, g := range googleGroups {
+	for _, g := range allGoogleGroups {
 		if s.ignoreGroup(g.Email) {
 			log.WithField("group", g.Email).Debug("ignoring group")
 			continue
@@ -508,11 +524,13 @@ func (s *syncGSuite) getGoogleGroupsAndUsers(googleGroups []*admin.Group) ([]*ad
 				return nil, nil, err
 			}
 
-			membersUsers = append(membersUsers, u[0])
+			if len(u) > 0 {
+				membersUsers = append(membersUsers, u[0])
 
-			_, ok := gUniqUsers[m.Email]
-			if !ok {
-				gUniqUsers[m.Email] = u[0]
+				_, ok := gUniqUsers[m.Email]
+				if !ok {
+					gUniqUsers[m.Email] = u[0]
+				}
 			}
 		}
 		gGroupsUsers[g.Name] = membersUsers
@@ -523,6 +541,41 @@ func (s *syncGSuite) getGoogleGroupsAndUsers(googleGroups []*admin.Group) ([]*ad
 	}
 
 	return gUsers, gGroupsUsers, nil
+}
+
+func (s *syncGSuite) getEmbeddedGoogleGroups(googleGroups []*admin.Group) ([]*admin.Group, error) {
+	newGoogleGroups := make([]*admin.Group, 0)
+
+	for _, g := range googleGroups {
+
+		log := log.WithFields(log.Fields{"group": g.Name})
+		log.Debug("check group members for embeded groups")
+
+		if s.ignoreGroup(g.Email) {
+			log.Debug("ignoring group")
+			continue
+		}
+		
+		groupMembers, err := s.google.GetGroupMembers(g)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, m := range groupMembers {
+			if m.Type == "GROUP" {
+				log.Debug("adding embedded group")
+				ng := new(admin.Group)
+				ng.Id = m.Id
+				ng.Email = m.Email
+				reg := regexp.MustCompile(`(?P<name>[a-z0-9._%+\-]+)@[a-z0-9.\-]+\.[a-z]{2,4}`)
+				ng.Name = reg.ReplaceAllString(m.Email, "${name}")
+				newGoogleGroups = append(newGoogleGroups, ng)
+			}
+		}
+		newGoogleGroups = append(newGoogleGroups, g)
+	}
+
+	return newGoogleGroups, nil
 }
 
 // getAWSGroupsAndUsers return a list of google users members of googleGroups
